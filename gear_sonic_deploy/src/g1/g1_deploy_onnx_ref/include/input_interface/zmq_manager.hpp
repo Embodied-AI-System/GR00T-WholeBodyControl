@@ -376,6 +376,30 @@ class ZMQManager : public InputInterface {
                                        heading_state_buffer,
                                        has_planner, planner_state, movement_state_buffer,
                                        current_motion_mutex, report_temperature);
+
+          // A command can request start while simultaneously switching to
+          // STREAMED_MOTION. Start only after the pose interface has decoded at
+          // least one streamed motion frame; otherwise CONTROL may run against
+          // the preloaded reference motion and fail encoder observation checks.
+          if (start_control_ && !operator_state.start) {
+            bool streamed_motion_ready = false;
+            {
+              std::lock_guard<std::mutex> lock(current_motion_mutex);
+              streamed_motion_ready =
+                current_motion &&
+                current_motion->name == "streamed" &&
+                current_motion->timesteps > 0 &&
+                current_frame < static_cast<int>(current_motion->timesteps);
+            }
+
+            if (streamed_motion_ready) {
+              operator_state.start = true;
+              reinitialize_heading = true;
+              std::cout << "[ZMQManager] Start control requested in STREAMED MOTION mode" << std::endl;
+            } else {
+              std::cout << "[ZMQManager] Deferring start until streamed motion is ready" << std::endl;
+            }
+          }
         }
       }
     }

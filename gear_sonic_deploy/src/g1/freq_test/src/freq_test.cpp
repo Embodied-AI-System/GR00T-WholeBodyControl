@@ -4,6 +4,7 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <numeric>
 #include <cstdlib>
 #include <ctime>
 
@@ -21,7 +22,7 @@ class ONNXFreqTest {
     };
   private:
     Ort::Env env;
-    Ort::Session* policy_session;
+    Ort::Session* policy_session = nullptr;
     Ort::AllocatorWithDefaultOptions allocator;
     std::vector<std::string> input_node_names_str;
     std::vector<std::string> output_node_names_str;
@@ -42,10 +43,10 @@ class ONNXFreqTest {
 
       try {
         std::cout << "Loading ONNX model: " << model_path << std::endl;
-        policy_session = new Ort::Session(env, model_path.c_str(), Ort::SessionOptions {nullptr});
         Ort::SessionOptions policy_session_options;
         policy_session_options.SetIntraOpNumThreads(1);
         policy_session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+        policy_session = new Ort::Session(env, model_path.c_str(), policy_session_options);
 
         // Query input names from the ONNX model
         size_t num_input_nodes = policy_session->GetInputCount();
@@ -201,40 +202,67 @@ class ONNXFreqTest {
       // Just complete the inference to measure performance
     }
 
-    void RunFrequencyTest(int num_iterations = 1000) {
-      std::cout << "\nRunning ONNX policy inference frequency test..." << std::endl;
-      std::cout << "Number of iterations: " << num_iterations << std::endl;
-
-      std::string mode_name = (data_mode == DataGenerationMode::ZEROS)    ? "ZEROS"
-                              : (data_mode == DataGenerationMode::RANDOM) ? "RANDOM"
-                                                                          : "ONES";
-      std::cout << "Using input data mode: " << mode_name << std::endl;
-
-      // Warmup run
-      RunInference();
-
-      auto start = std::chrono::steady_clock::now();
-
-      for (int i = 0; i < num_iterations; ++i) { RunInference(); }
-
-      auto end = std::chrono::steady_clock::now();
-
-      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-      double avg_time_us = static_cast<double>(duration.count()) / num_iterations;
-      double frequency_hz = 1000000.0 / avg_time_us;
-
-      std::cout << "\n=== Results ===" << std::endl;
-      std::cout << "Total time: " << duration.count() << " μs" << std::endl;
-      std::cout << "Average time per inference: " << avg_time_us << " μs" << std::endl;
-      std::cout << "Maximum frequency: " << frequency_hz << " Hz" << std::endl;
-    }
-
     void SetDataGenerationMode(DataGenerationMode mode) {
       data_mode = mode;
       std::string mode_name = (mode == DataGenerationMode::ZEROS)    ? "ZEROS"
                               : (mode == DataGenerationMode::RANDOM) ? "RANDOM"
                                                                      : "ONES";
       std::cout << "Set input data generation mode to: " << mode_name << std::endl;
+    }
+
+    static double Percentile(std::vector<double> values, double percentile) {
+      if (values.empty()) { return 0.0; }
+      std::sort(values.begin(), values.end());
+      double index = (percentile / 100.0) * static_cast<double>(values.size() - 1);
+      size_t lower = static_cast<size_t>(std::floor(index));
+      size_t upper = static_cast<size_t>(std::ceil(index));
+      if (lower == upper) { return values[lower]; }
+      double weight = index - static_cast<double>(lower);
+      return values[lower] * (1.0 - weight) + values[upper] * weight;
+    }
+
+    void RunFrequencyTest(int num_iterations = 1000, int warmup_iterations = 100) {
+      std::cout << "\nRunning ONNX policy inference frequency test..." << std::endl;
+      std::cout << "Warmup iterations: " << warmup_iterations << std::endl;
+      std::cout << "Measured iterations: " << num_iterations << std::endl;
+
+      std::string mode_name = (data_mode == DataGenerationMode::ZEROS)    ? "ZEROS"
+                              : (data_mode == DataGenerationMode::RANDOM) ? "RANDOM"
+                                                                          : "ONES";
+      std::cout << "Using input data mode: " << mode_name << std::endl;
+
+      for (int i = 0; i < warmup_iterations; ++i) { RunInference(); }
+
+      std::vector<double> latencies_us;
+      latencies_us.reserve(num_iterations);
+
+      auto total_start = std::chrono::steady_clock::now();
+      for (int i = 0; i < num_iterations; ++i) {
+        auto iter_start = std::chrono::steady_clock::now();
+        RunInference();
+        auto iter_end = std::chrono::steady_clock::now();
+        auto iter_duration = std::chrono::duration_cast<std::chrono::duration<double, std::micro>>(iter_end - iter_start);
+        latencies_us.push_back(iter_duration.count());
+      }
+      auto total_end = std::chrono::steady_clock::now();
+
+      auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(total_end - total_start);
+      double avg_time_us = std::accumulate(latencies_us.begin(), latencies_us.end(), 0.0) / latencies_us.size();
+      double frequency_hz = 1000000.0 / avg_time_us;
+      auto minmax = std::minmax_element(latencies_us.begin(), latencies_us.end());
+
+      std::cout << "\n=== Results ===" << std::endl;
+      std::cout << "Total measured time: " << total_duration.count() << " μs" << std::endl;
+      std::cout << "Average time per inference: " << avg_time_us << " μs" << std::endl;
+      std::cout << "p50 latency: " << Percentile(latencies_us, 50.0) << " μs" << std::endl;
+      std::cout << "p90 latency: " << Percentile(latencies_us, 90.0) << " μs" << std::endl;
+      std::cout << "p95 latency: " << Percentile(latencies_us, 95.0) << " μs" << std::endl;
+      std::cout << "p99 latency: " << Percentile(latencies_us, 99.0) << " μs" << std::endl;
+      std::cout << "Min latency: " << *minmax.first << " μs" << std::endl;
+      std::cout << "Max latency: " << *minmax.second << " μs" << std::endl;
+      std::cout << "Maximum frequency from average: " << frequency_hz << " Hz" << std::endl;
+      std::cout << "Approx frequency from p95: " << (1000000.0 / Percentile(latencies_us, 95.0)) << " Hz" << std::endl;
+      std::cout << "Approx frequency from p99: " << (1000000.0 / Percentile(latencies_us, 99.0)) << " Hz" << std::endl;
     }
 };
 
@@ -246,12 +274,14 @@ int main(int argc, char* argv[]) {
     std::cout << "  model_file: path to ONNX model file (required)" << std::endl;
     std::cout << "  iterations: number of inference iterations (default: 1000)" << std::endl;
     std::cout << "  data_mode: zeros|random|ones (default: random)" << std::endl;
-    std::cout << "\nExample: " << argv[0] << " policy.onnx 5000 random" << std::endl;
+    std::cout << "  warmup_iterations: number of warmup iterations (default: 100)" << std::endl;
+    std::cout << "\nExample: " << argv[0] << " policy.onnx 5000 random 200" << std::endl;
     return 1;
   }
 
   std::string model_file = argv[1];
   int num_iterations = 1000;
+  int warmup_iterations = 100;
   ONNXFreqTest::DataGenerationMode mode = ONNXFreqTest::DataGenerationMode::RANDOM;
 
   if (argc > 2) { num_iterations = std::atoi(argv[2]); }
@@ -266,6 +296,7 @@ int main(int argc, char* argv[]) {
       mode = ONNXFreqTest::DataGenerationMode::RANDOM;
     }
   }
+  if (argc > 4) { warmup_iterations = std::atoi(argv[4]); }
 
   std::cout << "ONNX Policy Frequency Test" << std::endl;
   std::cout << "===========================" << std::endl;
@@ -273,7 +304,7 @@ int main(int argc, char* argv[]) {
   try {
     ONNXFreqTest freq_test(model_file);
     freq_test.SetDataGenerationMode(mode);
-    freq_test.RunFrequencyTest(num_iterations);
+    freq_test.RunFrequencyTest(num_iterations, warmup_iterations);
   } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << std::endl;
     return -1;
